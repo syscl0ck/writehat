@@ -6,8 +6,8 @@ services:
     image: nginx:1.23.1
     volumes:
       - ./nginx:/opt/writehat/nginx
-      - ./writehat/config/nginx.conf:/etc/nginx/conf.d/writehat.conf
-      - ./writehat/static:/opt/writehat/static
+      - ./writehat/writehat/config/nginx.conf:/etc/nginx/conf.d/writehat.conf
+      - ./writehat/writehat/static:/opt/writehat/static
     ports:
       - 80:80
       - 443:443
@@ -18,7 +18,12 @@ services:
   writehat:
     build:
       context: .
-      dockerfile: ./writehat/config/Dockerfile.app
+      dockerfile: ./writehat/writehat/config/Dockerfile.app
+    environment:
+      - PYTHONPATH=/opt/writehat/writehat
+      - WRITEHAT_ADMIN_USERNAME=${WRITEHAT_ADMIN_USERNAME}
+      - WRITEHAT_ADMIN_PASSWORD=${WRITEHAT_ADMIN_PASSWORD}
+      - WRITEHAT_SECRET_KEY=${WRITEHAT_SECRET_KEY}
     command: bash -c "
       sleep 2 &&
       ./manage.py makemigrations writehat &&
@@ -28,6 +33,7 @@ services:
       uwsgi --socket 0.0.0.0:8000 --plugin-dir=/usr/lib/uwsgi/plugins --plugin python3 -w writehat.wsgi:application --processes=4 --master --vacuum"
     volumes:
       - .:/opt/writehat
+    working_dir: /opt/writehat/writehat
     expose:
       - 8000
     restart: unless-stopped
@@ -41,8 +47,8 @@ services:
       - ./mongo/configdb:/data/configdb
       - ./mongo/db:/data/db
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=root
-      - MONGO_INITDB_ROOT_PASSWORD=FORTHELOVEOFGEEBUSPLEASECHANGETHIS
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
     expose:
       - 27017
 
@@ -51,10 +57,10 @@ services:
     volumes:
       - ./mysql:/var/lib/mysql
     environment:
-      MYSQL_ROOT_PASSWORD: CHANGETHISIFYOUAREANINTELLIGENTHUMANBEING
-      MYSQL_DATABASE: writehat
-      MYSQL_USER: writehat
-      MYSQL_PASSWORD: CHANGETHISIFYOUAREANINTELLIGENTHUMANBEING
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     expose:
       - 3306
     restart: unless-stopped

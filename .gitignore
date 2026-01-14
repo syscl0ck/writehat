@@ -3,3 +3,5 @@ mysql/
 venv/
 **/__pycache__/**
 migrations
+.env
+writehat.conf
