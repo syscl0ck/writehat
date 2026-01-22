@@ -1636,10 +1636,10 @@ def reportsList(request, uuid):
     
     elif request.method == 'POST':
         reportsList = []
-        for i in reports:
+        for report in reports:
             log.debug(f"  Report: {report.id}")
-            reportsList.append(str(i.id))
-        return JsonResponse(reportsList)
+            reportsList.append({'id': str(report.id), 'name': report.name})
+        return JsonResponse(reportsList, safe=False)
 
 
 @csrf_protect
@@ -1651,6 +1651,670 @@ def engagementFindingCreate(request, uuid):
     p.save()
     log.debug(f'engagementFindingCreate called, resolved to type ({fgroup.scoringType}) resulting engagementFinding UUID {p.id} and parent (fgroup) id of {uuid}')
     return HttpResponse(p.id)
+
+
+@csrf_protect
+@require_http_methods(['POST'])
+def engagementFileUpload(request):
+    '''
+    Handle file uploads for engagements:
+    - normalized.json: Populate Table components for Table of Tables
+    - findings.json: Populate findings section
+    - executive_summary.md: Populate Container - Executive Summary section
+    '''
+    log.debug('engagementFileUpload called')
+
+    try:
+        engagement_id = request.POST.get('engagementID')
+        report_id = request.POST.get('reportID')
+
+        if not engagement_id or not report_id:
+            response = HttpResponse('Missing engagementID or reportID')
+            response.status_code = 400
+            return response
+
+        # Get the report
+        report = Report.get(id=report_id)
+        if str(report.engagementParent) != str(engagement_id):
+            response = HttpResponse('Report does not belong to engagement')
+            response.status_code = 400
+            return response
+
+        # Get the current full component tree - we'll modify it and save at the end
+        components_json = json.loads(report._components)
+        components_updated = False
+        
+        # Helper function to check if a component UUID already exists in the JSON tree
+        def component_exists_in_json(uuid_str, components_list):
+            """Recursively check if a component UUID exists in the component tree"""
+            for comp in components_list:
+                if comp.get('uuid') == uuid_str:
+                    return True
+                if 'children' in comp and comp['children']:
+                    if component_exists_in_json(uuid_str, comp['children']):
+                        return True
+            return False
+        
+        # Helper function to get all existing UUIDs from the JSON tree
+        def get_all_component_uuids(components_list):
+            """Recursively get all component UUIDs from the tree"""
+            uuids = set()
+            for comp in components_list:
+                if 'uuid' in comp:
+                    uuids.add(comp['uuid'])
+                if 'children' in comp and comp['children']:
+                    uuids.update(get_all_component_uuids(comp['children']))
+            return uuids
+        
+        # Track created findings to add to report
+        created_finding_uuids = []
+        # Get existing findings as strings
+        existing_finding_uuids = [str(uuid) for uuid in report.finding_uuids]
+
+        # Process normalized.json - populate Table components
+        if 'normalized_json' in request.FILES:
+            normalized_file = request.FILES['normalized_json']
+            if normalized_file.name == 'normalized.json':
+                try:
+                    file_content = normalized_file.read().decode('utf-8')
+                    normalized_data = json.loads(file_content)
+                    
+                    # Extract tables from normalized_data - handle both list and dict formats
+                    tables_list = None
+                    if isinstance(normalized_data, list):
+                        tables_list = normalized_data
+                    elif isinstance(normalized_data, dict):
+                        # Try common keys for tables
+                        if 'tables' in normalized_data and isinstance(normalized_data['tables'], list):
+                            tables_list = normalized_data['tables']
+                        elif 'data' in normalized_data and isinstance(normalized_data['data'], list):
+                            tables_list = normalized_data['data']
+                        else:
+                            # If it's a dict, try to use values that are dicts with table-like structure
+                            # (have 'caption' or 'text' keys)
+                            potential_tables = []
+                            for key, value in normalized_data.items():
+                                if isinstance(value, dict) and ('caption' in value or 'text' in value):
+                                    potential_tables.append(value)
+                            if potential_tables:
+                                tables_list = potential_tables
+                            else:
+                                # Last resort: treat each dict value as a potential table
+                                tables_list = [v for v in normalized_data.values() if isinstance(v, dict)]
+                    
+                    # Helper function to convert dict to HTML table markdown
+                    def dict_to_table_markdown(data, title=None):
+                        """Convert a dict to HTML table markdown format"""
+                        if not isinstance(data, dict):
+                            return ''
+                        
+                        # Create a two-column table: Key | Value
+                        lines = ['| Key | Value |', '|-----|-------|']
+                        for key, value in data.items():
+                            # Skip nested dicts and lists - handle them separately
+                            if isinstance(value, (dict, list)):
+                                value_str = f"({len(value)} items)" if isinstance(value, list) else "(nested object)"
+                            else:
+                                value_str = str(value) if value is not None else ''
+                            # Escape pipe characters
+                            key_str = str(key).replace('|', '\\|')
+                            value_str = value_str.replace('|', '\\|')
+                            lines.append(f'| {key_str} | {value_str} |')
+                        return '\n'.join(lines)
+                    
+                    # Update existing Table components based on normalized data
+                    if tables_list:
+                        log.info(f'Processing {len(tables_list)} tables from normalized.json')
+                        for idx, table_data in enumerate(tables_list):
+                            if not isinstance(table_data, dict):
+                                log.warning(f'Table {idx+1} is not a dict, skipping')
+                                continue
+                                
+                            # Get or generate caption
+                            target_caption = table_data.get('caption', '')
+                            if not target_caption:
+                                # Try to create a meaningful caption from keys or title
+                                if 'name' in table_data:
+                                    target_caption = str(table_data['name'])
+                                elif 'title' in table_data:
+                                    target_caption = str(table_data['title'])
+                                else:
+                                    # Use the key from normalized_data that this came from
+                                    target_caption = f'Data Table {idx+1}'
+                            
+                            log.debug(f'Processing table {idx+1}: caption="{target_caption}", data keys: {list(table_data.keys())}')
+                            
+                            # Convert data to table format if not already in table format
+                            table_text = table_data.get('text', '')
+                            if not table_text:
+                                table_text = dict_to_table_markdown(table_data, target_caption)
+                            
+                            # Find existing Table component by caption
+                            table_component = None
+                            
+                            # Check flattened components first (most reliable)
+                            for component in report.flattened_components:
+                                if component.type == 'TableComponent':
+                                    component_caption = getattr(component, 'caption', '') or ''
+                                    if component_caption == target_caption:
+                                        table_component = component
+                                        break
+                            
+                            if table_component:
+                                # Update existing table directly
+                                table_component._model['text'] = table_text
+                                table_component._model['caption'] = target_caption
+                                table_component.save()
+                                components_updated = True
+                                # Check if component is already in JSON - if not, add it
+                                if not component_exists_in_json(str(table_component.id), components_json):
+                                    log.debug(f'Table component {table_component.id} exists but not in JSON, adding it')
+                                    components_json.append({
+                                        'uuid': str(table_component.id),
+                                        'type': 'TableComponent'
+                                    })
+                                    components_updated = True
+                            else:
+                                # Create new Table component
+                                log.debug(f'Creating new table component')
+                                table_component = BaseComponent.new(
+                                    componentType='TableComponent',
+                                    reportParent=report_id
+                                )
+                                table_component._model['text'] = table_text
+                                table_component._model['caption'] = target_caption
+                                table_component._model['name'] = table_data.get('name', target_caption)
+                                table_component.save()
+                                log.debug(f'Created table component: {table_component.id}')
+                                
+                                # Add new component to the JSON tree (at root level) only if it doesn't exist
+                                if not component_exists_in_json(str(table_component.id), components_json):
+                                    components_json.append({
+                                        'uuid': str(table_component.id),
+                                        'type': 'TableComponent'
+                                    })
+                                    components_updated = True
+                                    log.debug(f'Added table to components_json, total components: {len(components_json)}')
+                                else:
+                                    log.debug(f'Table component {table_component.id} already exists in JSON, skipping')
+
+                        log.info(f'Processed normalized.json: {len(tables_list)} tables')
+                    else:
+                        log.warning(f'Could not extract tables from normalized.json. Type: {type(normalized_data)}')
+                except json.JSONDecodeError as e:
+                    log.error(f'Invalid JSON in normalized.json: {e}')
+                    response = HttpResponse(f'Invalid JSON in normalized.json: {e}')
+                    response.status_code = 400
+                    return response
+                except Exception as e:
+                    log.error(f'Error processing normalized.json: {e}')
+                    import traceback
+                    log.error(traceback.format_exc())
+                    response = HttpResponse(f'Error processing normalized.json: {e}')
+                    response.status_code = 500
+                    return response
+
+        # Process findings.json - populate findings
+        if 'findings_json' in request.FILES:
+            findings_file = request.FILES['findings_json']
+            if findings_file.name == 'findings.json':
+                try:
+                    file_content = findings_file.read().decode('utf-8')
+                    findings_data = json.loads(file_content)
+                    log.info(f'Loaded findings.json: root type={type(findings_data).__name__}')
+                    if isinstance(findings_data, dict):
+                        log.info(f'  Top-level keys: {list(findings_data.keys())}')
+                    
+                    # Extract findings from findings_data - handle both list and dict formats
+                    findings_list = None
+                    if isinstance(findings_data, list):
+                        findings_list = findings_data
+                    elif isinstance(findings_data, dict):
+                        # Check for categories array first (most common structure)
+                        if 'categories' in findings_data:
+                            if isinstance(findings_data['categories'], list):
+                                # categories is an array - each category becomes a finding
+                                log.info(f'Found categories array with {len(findings_data["categories"])} categories')
+                                findings_list = []
+                                for category in findings_data['categories']:
+                                    if isinstance(category, dict):
+                                        # Convert category to finding format
+                                        category_finding = {}
+                                        # Map category name to finding name
+                                        category_finding['name'] = category.get('category') or category.get('name') or 'Unnamed Category'
+                                        # Use severity if available
+                                        if 'severity' in category:
+                                            category_finding['severity'] = category['severity']
+                                        # Combine description and detailed_description for the description field
+                                        description_parts = []
+                                        if category.get('description'):
+                                            description_parts.append(category['description'])
+                                        if category.get('detailed_description'):
+                                            description_parts.append('\n\n' + category['detailed_description'])
+                                        if description_parts:
+                                            category_finding['description'] = '\n'.join(description_parts)
+                                        # Convert key_risks to background or include in description
+                                        if category.get('key_risks'):
+                                            risks_text = 'Key Risks:\n' + '\n'.join(['- ' + risk for risk in category['key_risks']])
+                                            if 'description' in category_finding:
+                                                category_finding['description'] += '\n\n' + risks_text
+                                            else:
+                                                category_finding['description'] = risks_text
+                                        # Convert recommendations to remediation
+                                        if category.get('recommendations'):
+                                            category_finding['remediation'] = '\n'.join(['- ' + rec for rec in category['recommendations']])
+                                        
+                                        # Extract and format affected resources
+                                        affected_resources = []
+                                        
+                                        # Handle findings array (for exposed services, vulnerabilities, TLS/SSL issues)
+                                        if category.get('findings') and isinstance(category['findings'], list):
+                                            findings_array = category['findings']
+                                            
+                                            # Check what type of findings we have
+                                            if findings_array and isinstance(findings_array[0], dict):
+                                                first_finding = findings_array[0]
+                                                
+                                                # Exposed Services: hostname:port/service format
+                                                if 'hostname' in first_finding and 'port' in first_finding:
+                                                    for finding in findings_array:
+                                                        hostname = finding.get('hostname', '')
+                                                        port = finding.get('port', '')
+                                                        service = finding.get('service', '')
+                                                        if hostname and port:
+                                                            resource_str = f"{hostname}:{port}"
+                                                            if service:
+                                                                resource_str += f" ({service})"
+                                                            affected_resources.append(f"- {resource_str}")
+                                                
+                                                # TLS/SSL Issues: hostname with finding details
+                                                elif 'hostname' in first_finding and 'finding' in first_finding:
+                                                    unique_hosts = {}
+                                                    for finding in findings_array:
+                                                        hostname = finding.get('hostname', '')
+                                                        finding_detail = finding.get('finding', '')
+                                                        finding_id = finding.get('id', '')
+                                                        if hostname:
+                                                            if hostname not in unique_hosts:
+                                                                unique_hosts[hostname] = []
+                                                            detail_str = f"{hostname}"
+                                                            if finding_id:
+                                                                detail_str += f" - {finding_id}"
+                                                            if finding_detail:
+                                                                detail_str += f": {finding_detail}"
+                                                            if detail_str not in unique_hosts[hostname]:
+                                                                unique_hosts[hostname].append(detail_str)
+                                                    
+                                                    for hostname, details in sorted(unique_hosts.items()):
+                                                        for detail in details:
+                                                            affected_resources.append(f"- {detail}")
+                                                
+                                                # Vulnerabilities: hostname with title/CVE
+                                                elif 'hostname' in first_finding and 'title' in first_finding:
+                                                    for finding in findings_array:
+                                                        hostname = finding.get('hostname', '')
+                                                        title = finding.get('title', '')
+                                                        cves = finding.get('cves', [])
+                                                        resource_str = f"- {hostname}"
+                                                        if title:
+                                                            resource_str += f": {title}"
+                                                        if cves:
+                                                            resource_str += f" ({', '.join(cves)})"
+                                                        affected_resources.append(resource_str)
+                                        
+                                        # Handle repositories_affected (for Git-related findings)
+                                        if category.get('repositories_affected'):
+                                            repo_count = category['repositories_affected']
+                                            affected_resources.append(f"- **Repositories Affected:** {repo_count}")
+                                            
+                                            # Add top secret types if available
+                                            if category.get('top_secret_types'):
+                                                affected_resources.append("\n**Top Secret Types:**")
+                                                for secret_type in category['top_secret_types']:
+                                                    type_name = secret_type.get('type', 'Unknown')
+                                                    type_count = secret_type.get('count', 0)
+                                                    affected_resources.append(f"  - {type_name}: {type_count}")
+                                            
+                                            # Add severity breakdown if available
+                                            if category.get('severity_breakdown'):
+                                                affected_resources.append("\n**Severity Breakdown:**")
+                                                for severity, count in category['severity_breakdown'].items():
+                                                    affected_resources.append(f"  - {severity}: {count}")
+                                        
+                                        # Handle CDN breakdown
+                                        if category.get('cdn_breakdown'):
+                                            affected_resources.append("**CDN Types:**")
+                                            for cdn_name, cdn_count in category['cdn_breakdown'].items():
+                                                affected_resources.append(f"- {cdn_name}: {cdn_count}")
+                                        
+                                        # Set affectedResources if we collected any
+                                        if affected_resources:
+                                            category_finding['affectedResources'] = '\n'.join(affected_resources)
+                                        
+                                        # Add count information to description if available (if not already in affectedResources)
+                                        if category.get('count') and not affected_resources:
+                                            count_info = f"\n\nAffected Items: {category['count']}"
+                                            if 'description' in category_finding:
+                                                category_finding['description'] += count_info
+                                            else:
+                                                category_finding['description'] = count_info
+                                        
+                                        findings_list.append(category_finding)
+                                log.info(f'Converted {len(findings_list)} categories to findings')
+                            elif isinstance(findings_data['categories'], dict):
+                                # Extract findings from categories dict structure (legacy support)
+                                all_findings = []
+                                
+                                def extract_findings_recursive(data, category_path=""):
+                                    """Recursively extract findings from nested category structures"""
+                                    findings = []
+                                    if isinstance(data, list):
+                                        # This is a list of findings
+                                        for finding in data:
+                                            if isinstance(finding, dict):
+                                                if category_path:
+                                                    finding['_category_path'] = category_path
+                                                findings.append(finding)
+                                    elif isinstance(data, dict):
+                                        # Check if this dict itself looks like a finding (has finding-like keys)
+                                        finding_keys = ['name', 'title', 'description', 'severity', 'cvss', 'vector', 'finding']
+                                        if any(key in data for key in finding_keys):
+                                            # This dict is a finding
+                                            if category_path:
+                                                data['_category_path'] = category_path
+                                            findings.append(data)
+                                        elif 'findings' in data:
+                                            # Has a 'findings' key
+                                            if isinstance(data['findings'], list):
+                                                for finding in data['findings']:
+                                                    if isinstance(finding, dict):
+                                                        finding_path = category_path
+                                                        if finding_path:
+                                                            finding_path += " / "
+                                                        finding_path += data.get('name', '')
+                                                        if finding_path:
+                                                            finding['_category_path'] = finding_path
+                                                        findings.append(finding)
+                                            elif isinstance(data['findings'], dict):
+                                                # Recursively process nested findings
+                                                findings.extend(extract_findings_recursive(data['findings'], category_path))
+                                        else:
+                                            # Process each value in the dict
+                                            for key, value in data.items():
+                                                if isinstance(value, (dict, list)):
+                                                    new_path = category_path
+                                                    if new_path:
+                                                        new_path += " / "
+                                                    new_path += key
+                                                    findings.extend(extract_findings_recursive(value, new_path))
+                                    return findings
+                                
+                                all_findings = extract_findings_recursive(findings_data['categories'])
+                                log.info(f'Extracted {len(all_findings)} findings from categories dict')
+                                if all_findings:
+                                    findings_list = all_findings
+                        # Try common keys for findings (if not already set)
+                        elif 'findings' in findings_data and isinstance(findings_data['findings'], list):
+                            findings_list = findings_data['findings']
+                        elif 'data' in findings_data and isinstance(findings_data['data'], list):
+                            findings_list = findings_data['data']
+                        else:
+                            # If it's a dict, try to use values that are dicts with finding-like structure
+                            # (have 'name' or 'title' keys) - but skip 'summary' and other metadata
+                            potential_findings = []
+                            for key, value in findings_data.items():
+                                # Skip summary and other metadata fields
+                                if key in ['summary', 'generated_at', 'metadata']:
+                                    continue
+                                if isinstance(value, dict) and ('name' in value or 'title' in value or 'category' in value):
+                                    potential_findings.append(value)
+                            if potential_findings:
+                                findings_list = potential_findings
+                            else:
+                                # Last resort: treat each dict value as a potential finding (excluding summary)
+                                findings_list = [v for k, v in findings_data.items() 
+                                                if isinstance(v, dict) and k not in ['summary', 'generated_at', 'metadata']]
+                    
+                    # Find or create Findings component
+                    findings_component = None
+                    finding_group = None
+                    
+                    # First, try to find existing FindingsList component
+                    for component in report.flattened_components:
+                        if component.type == 'FindingsList':
+                            findings_component = component
+                            # Get the finding group from the component if it exists
+                            if hasattr(component, 'findingGroup') and component.findingGroup:
+                                try:
+                                    finding_group = BaseFindingGroup.get_child(id=component.findingGroup)
+                                except EngagementFgroupError:
+                                    pass
+                            break
+                    
+                    # If no finding group from component, try to get the first finding group from engagement
+                    if not finding_group:
+                        from writehat.lib.engagement import Engagement
+                        engagement = Engagement.get(id=engagement_id)
+                        if engagement.fgroups:
+                            finding_group = engagement.fgroups[0]
+                        else:
+                            # Create a default CVSS finding group
+                            from writehat.lib.findingGroup import CVSSFindingGroup
+                            finding_group = CVSSFindingGroup()
+                            finding_group.engagementParent = engagement_id
+                            finding_group.name = 'Findings'
+                            finding_group.save()
+                    
+                    # Link FindingsList component to finding group if it exists but isn't linked
+                    if findings_component and not findings_component.findingGroup:
+                        findings_component._model['findingGroup'] = str(finding_group.id)
+                        findings_component.save()
+                        components_updated = True
+                    
+                    # Process findings_list - expect a list of finding objects
+                    if findings_list and finding_group:
+                        log.info(f'Processing {len(findings_list)} findings from findings.json (finding group: {finding_group.id})')
+                        for idx, finding_data in enumerate(findings_list):
+                            if not isinstance(finding_data, dict):
+                                log.warning(f'Skipping finding that is not a dict: {type(finding_data)}')
+                                continue
+                            
+                            log.debug(f'Processing finding {idx+1}/{len(findings_list)}: keys={list(finding_data.keys())}')
+                            
+                            # Create the finding using the automated helper function
+                            try:
+                                from writehat.lib.engagementFinding import create_finding_from_data
+                                finding = create_finding_from_data(
+                                    finding_data=finding_data,
+                                    finding_group=finding_group
+                                )
+                                # Track the finding UUID to add to report
+                                created_finding_uuids.append(str(finding.id))
+                            except Exception as e:
+                                log.error(f'Error creating finding: {e}')
+                                import traceback
+                                log.error(traceback.format_exc())
+                                # Continue with other findings even if one fails
+                                continue
+                    else:
+                        if not findings_list:
+                            log.warning(f'Could not extract findings from findings.json. Type: {type(findings_data)}')
+                        if not finding_group:
+                            log.warning('No finding group available for findings.json')
+                    
+                    log.info(f'Processed findings.json, created {len(created_finding_uuids)} findings')
+                    # Verify findings are accessible from the engagement
+                    if created_finding_uuids and finding_group:
+                        from writehat.lib.engagement import Engagement
+                        engagement = Engagement.get(id=engagement_id)
+                        total_findings = sum(len(fg.findings) for fg in engagement.fgroups)
+                        log.info(f'Engagement now has {total_findings} total findings across {len(engagement.fgroups)} finding groups')
+                except json.JSONDecodeError as e:
+                    log.error(f'Invalid JSON in findings.json: {e}')
+                    response = HttpResponse(f'Invalid JSON in findings.json: {e}')
+                    response.status_code = 400
+                    return response
+                except Exception as e:
+                    log.error(f'Error processing findings.json: {e}')
+                    import traceback
+                    log.error(traceback.format_exc())
+                    # Don't fail the whole request if findings processing fails
+
+        # Process executive_summary.md - populate Executive Summary Container
+        if 'executive_summary_md' in request.FILES:
+            executive_file = request.FILES['executive_summary_md']
+            if executive_file.name == 'executive_summary.md':
+                executive_content = executive_file.read().decode('utf-8')
+                
+                # Find or create Container component named "Executive Summary"
+                exec_summary_container = None
+                exec_summary_markdown = None
+                container_in_json = None
+                
+                # First, try to find existing Container named "Executive Summary"
+                for component in report.flattened_components:
+                    if component.type == 'ContainerComponent' and component.name == 'Executive Summary':
+                        exec_summary_container = component
+                        # Check if it has a Markdown child
+                        if hasattr(component, 'children') and component.children:
+                            for child in component.children:
+                                if child.type == 'MarkdownComponent':
+                                    exec_summary_markdown = child
+                                    break
+                        break
+                
+                # Find the container in the JSON structure
+                def find_container_in_json(components):
+                    for comp in components:
+                        if comp.get('uuid') == str(exec_summary_container.id) if exec_summary_container else None:
+                            return comp
+                        if 'children' in comp:
+                            found = find_container_in_json(comp['children'])
+                            if found:
+                                return found
+                    return None
+                
+                if exec_summary_container:
+                    container_in_json = find_container_in_json(components_json)
+                    
+                    # Update existing container's markdown child or create one
+                    if exec_summary_markdown:
+                        # Update existing markdown component directly
+                        exec_summary_markdown._model['text'] = executive_content
+                        exec_summary_markdown.save()
+                    else:
+                        # Create Markdown component inside container
+                        exec_summary_markdown = BaseComponent.new(
+                            componentType='MarkdownComponent',
+                            reportParent=report_id,
+                            databaseParent=str(exec_summary_container.id)
+                        )
+                        exec_summary_markdown._model['text'] = executive_content
+                        exec_summary_markdown._model['name'] = 'Executive Summary'
+                        exec_summary_markdown.save()
+                        
+                        # Add to container's children in JSON structure
+                        if container_in_json:
+                            if 'children' not in container_in_json:
+                                container_in_json['children'] = []
+                            container_in_json['children'].append({
+                                'uuid': str(exec_summary_markdown.id),
+                                'type': 'MarkdownComponent'
+                            })
+                        components_updated = True
+                else:
+                    # Create new Container with Markdown child
+                    exec_summary_container = BaseComponent.new(
+                        componentType='ContainerComponent',
+                        reportParent=report_id
+                    )
+                    exec_summary_container._model['name'] = 'Executive Summary'
+                    exec_summary_container.save()
+                    
+                    exec_summary_markdown = BaseComponent.new(
+                        componentType='MarkdownComponent',
+                        reportParent=report_id,
+                        databaseParent=str(exec_summary_container.id)
+                    )
+                    exec_summary_markdown._model['text'] = executive_content
+                    exec_summary_markdown._model['name'] = 'Executive Summary'
+                    exec_summary_markdown.save()
+                    
+                    # Add to report components - append to root level only if it doesn't exist
+                    if not component_exists_in_json(str(exec_summary_container.id), components_json):
+                        components_json.append({
+                            'uuid': str(exec_summary_container.id),
+                            'type': 'ContainerComponent',
+                            'children': [{
+                                'uuid': str(exec_summary_markdown.id),
+                                'type': 'MarkdownComponent'
+                            }]
+                        })
+                        components_updated = True
+                        log.info('Processed executive_summary.md')
+                    else:
+                        log.info('Executive Summary container already exists in JSON, skipping append')
+
+        # Final deduplication pass - remove duplicate UUIDs from components_json
+        def deduplicate_components(components_list):
+            """Recursively remove duplicate components by UUID"""
+            seen_uuids = set()
+            deduplicated = []
+            for comp in components_list:
+                comp_uuid = comp.get('uuid')
+                if comp_uuid and comp_uuid in seen_uuids:
+                    log.warning(f'Found duplicate component UUID {comp_uuid} ({comp.get("type", "unknown")}), removing duplicate')
+                    continue
+                if comp_uuid:
+                    seen_uuids.add(comp_uuid)
+                # Recursively deduplicate children
+                if 'children' in comp and comp['children']:
+                    comp['children'] = deduplicate_components(comp['children'])
+                deduplicated.append(comp)
+            return deduplicated
+        
+        if components_updated:
+            original_count = len(get_all_component_uuids(components_json))
+            components_json = deduplicate_components(components_json)
+            deduplicated_count = len(get_all_component_uuids(components_json))
+            if original_count != deduplicated_count:
+                log.info(f'Deduplicated components: {original_count} -> {deduplicated_count} unique components')
+        
+        # Collect all finding UUIDs (existing + newly created)
+        findings_to_update = None
+        if created_finding_uuids:
+            all_finding_uuids = existing_finding_uuids + created_finding_uuids
+            log.info(f'Adding {len(created_finding_uuids)} new findings to report. Total findings: {len(all_finding_uuids)}')
+            findings_to_update = all_finding_uuids  # Already strings
+        
+        # Update the report with the complete component tree and findings if we made changes
+        if components_updated or findings_to_update:
+            if findings_to_update:
+                log.info(f'Updating report with {len(findings_to_update)} findings')
+            if components_updated:
+                log.info(f'Updating report with {len(components_json)} components')
+            # Always pass componentJSON (either updated or original) if we're updating findings
+            # Otherwise only pass if components_updated is True
+            if components_updated:
+                report.update(componentJSON=components_json, findings=findings_to_update)
+            elif findings_to_update:
+                # Only update findings, components stay the same
+                report.update(findings=findings_to_update)
+            # Force a refresh of the report's component cache
+            report._component_objects = None
+            log.info('Report updated successfully')
+
+        response = HttpResponse('Files uploaded and processed successfully')
+        response.status_code = 200
+        return response
+
+    except Exception as e:
+        log.error(f'Error in engagementFileUpload: {e}')
+        import traceback
+        log.error(traceback.format_exc())
+        response = HttpResponse(f'Error processing files: {e}')
+        response.status_code = 500
+        return response
 
 
 # Displays the list of existing reports and allows for the creation of a new one

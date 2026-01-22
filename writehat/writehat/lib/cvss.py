@@ -178,7 +178,7 @@ class CVSS:
     @classmethod
     def defaultChoice(cls, field):
 
-        return cls.default_fields[field].keys()[0]
+        return next(iter(cls.default_fields[field].keys()))
 
 
     @property

@@ -22,6 +22,7 @@
           <th><strong>Modified</strong></th>
           <th></th>
           <th></th>
+          <th></th>
         </tr>
       </thead>
       <tbody class="text-nowrap">
@@ -49,6 +50,11 @@
               <a href="/engagements/edit/{{ engagement.id }}">
                 {{ engagement.modifiedDate }}
               </a>
+            </td>
+            <td>
+              <div class="floating float-right mt-1">
+                {% include 'snippets/smallButton.html' with title='Upload Files' type='upload' class='engagementUpload text-white' %}
+              </div>
             </td>
             <td>
               <div class="floating float-right mt-1">

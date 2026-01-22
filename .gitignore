@@ -5,3 +5,6 @@ venv/
 migrations
 .env
 writehat.conf
+
+# Don't save the results folders
+results/

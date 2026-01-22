@@ -1,0 +1,41 @@
+{% extends 'layouts/modal.html' %}
+
+{% block title %}Upload Files{% endblock %}
+
+{% block body %}
+  <form id="engagementFileUploadForm" enctype="multipart/form-data">
+    <table class="writehat-form">
+      <tr>
+        <th><label for="id_report_select">Report:</label></th>
+        <td>
+          <select id="id_report_select" name="reportID" required style="width: 100%">
+            <option value="">Select a report...</option>
+          </select>
+        </td>
+      </tr>
+      <tr>
+        <th><label for="id_normalized_json">normalized.json:</label></th>
+        <td>
+          <input type="file" id="id_normalized_json" name="normalized_json" accept=".json" />
+        </td>
+      </tr>
+      <tr>
+        <th><label for="id_findings_json">findings.json:</label></th>
+        <td>
+          <input type="file" id="id_findings_json" name="findings_json" accept=".json" />
+        </td>
+      </tr>
+      <tr>
+        <th><label for="id_executive_summary_md">executive_summary.md:</label></th>
+        <td>
+          <input type="file" id="id_executive_summary_md" name="executive_summary_md" accept=".md" />
+        </td>
+      </tr>
+    </table>
+  </form>
+{% endblock %}
+
+{% block footer %}
+  {% include 'snippets/textButton.html' with name='Cancel' type='times' class='btn-light border border-dark' id='engagementFileUploadCancel' %}
+  {% include 'snippets/textButton.html' with name='Upload' type='upload' class='btn-success' id='engagementFileUploadSubmit' %}
+{% endblock %}

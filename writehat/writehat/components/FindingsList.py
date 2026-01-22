@@ -43,7 +43,11 @@ class Component(BaseComponent):
 
     def preprocess(self, context):
 
-        context['findingGroup'] = self.getFindingGroup
+        findingGroup = self.getFindingGroup
+        # Ensure the findingGroup has access to the report for filtering findings
+        if findingGroup and hasattr(self, 'report') and self.report:
+            findingGroup._report_object = self.report
+        context['findingGroup'] = findingGroup
 
         return super().preprocess(context)
 

@@ -107,6 +107,7 @@ urlpatterns = [
     url(rf'^engagements/{uuid}/report/new$', views.reportNew),
     url(rf'^engagements/{uuid}/report/create$', views.reportCreate),
     url(rf'^engagements/{uuid}/report/list$', views.reportsList),
+    path('engagements/fileUpload', views.engagementFileUpload),
 
 
     # customer urls
