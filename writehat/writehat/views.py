@@ -1719,6 +1719,21 @@ def engagementFileUpload(request):
                     file_content = normalized_file.read().decode('utf-8')
                     normalized_data = json.loads(file_content)
                     
+                    # Store normalized.json content for Technical_Reference_Table components to access
+                    try:
+                        import os
+                        from django.conf import settings
+                        # Create a directory for engagement files if it doesn't exist
+                        engagement_files_dir = os.path.join(settings.BASE_DIR, 'engagement_files')
+                        os.makedirs(engagement_files_dir, exist_ok=True)
+                        # Save normalized.json for this engagement
+                        normalized_file_path = os.path.join(engagement_files_dir, f'normalized_{engagement_id}.json')
+                        with open(normalized_file_path, 'w', encoding='utf-8') as f:
+                            f.write(file_content)
+                        log.debug(f'Stored normalized.json at: {normalized_file_path}')
+                    except Exception as e:
+                        log.warning(f'Could not store normalized.json file: {e}')
+                    
                     # Extract tables from normalized_data - handle both list and dict formats
                     tables_list = None
                     if isinstance(normalized_data, list):
